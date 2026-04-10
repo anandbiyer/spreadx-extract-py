@@ -34,6 +34,60 @@ def rasterize_page(
         doc.close()
 
 
+def rotate_image_90(image_bytes: bytes) -> bytes:
+    """Rotate image 90 degrees counter-clockwise. Used as a retry strategy
+    when vision extraction returns 0 rows on pages with sideways content."""
+    import io
+
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(image_bytes))
+    img = img.rotate(90, expand=True)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def detect_and_correct_rotation(
+    image_bytes: bytes,
+    page_rect_width: float,
+    page_rect_height: float,
+) -> bytes:
+    """Detect if rasterized content is landscape in a portrait page and rotate.
+
+    Checks the non-white bounding box of the rasterized image against the
+    page dimensions. If the page is portrait but the content is landscape
+    (width > height * 1.3), rotates 90 degrees so Claude Vision sees the
+    table right-side-up.
+
+    Returns corrected PNG bytes, or original if no rotation needed.
+    """
+    import io
+
+    from PIL import Image
+
+    # Only correct portrait pages
+    if page_rect_width >= page_rect_height:
+        return image_bytes
+
+    img = Image.open(io.BytesIO(image_bytes))
+    bbox = img.getbbox()
+    if not bbox:
+        return image_bytes  # Blank image — nothing to rotate
+
+    content_width = bbox[2] - bbox[0]
+    content_height = bbox[3] - bbox[1]
+
+    # Content aspect ratio suggests landscape table in portrait page
+    if content_width > content_height * 1.3:
+        img = img.rotate(90, expand=True)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    return image_bytes
+
+
 def rasterize_pages(
     pdf_bytes: bytes, page_numbers: list[int], scale: float = 2.0
 ) -> dict[int, bytes]:

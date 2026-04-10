@@ -54,3 +54,42 @@ def pdf_cash_america() -> bytes:
 def pdf_tfg_llp() -> bytes:
     """TFG Asset Management UK LLP 2024 — T6 UK LLP, digital."""
     return (FIXTURES_DIR / "TFG_Asset_management_UK_LLP_2024.pdf").read_bytes()
+
+
+# ── Regression fixtures (diagnosed failure cases) ──
+
+
+@pytest.fixture(scope="session")
+def pdf_freddie2023() -> bytes:
+    """Freddie Mac 2023 — multi-statement pages, split balance sheet."""
+    path = FIXTURES_DIR / "freddie2023.pdf"
+    if not path.exists():
+        pytest.skip(f"Fixture not found: {path}")
+    return path.read_bytes()
+
+
+@pytest.fixture(scope="session")
+def pdf_fubon() -> bytes:
+    """Fubon Securities Co Ltd 2017 — vector-drawn, landscape balance sheet."""
+    path = FIXTURES_DIR / "Fubon_Securities_Co_Ltd_2017.pdf"
+    if not path.exists():
+        pytest.skip(f"Fixture not found: {path}")
+    return path.read_bytes()
+
+
+@pytest.fixture(scope="session")
+def pdf_hdfc_credila() -> bytes:
+    """HDFC Credila 2023 — hybrid pages with vector-drawn labels."""
+    path = FIXTURES_DIR / "hdfc_credila_2023.pdf"
+    if not path.exists():
+        pytest.skip(f"Fixture not found: {path}")
+    return path.read_bytes()
+
+
+@pytest.fixture(scope="session")
+def pdf_labranche() -> bytes:
+    """LaBranche & Co Inc 2008 — all vector-drawn, dense cash flow page."""
+    path = FIXTURES_DIR / "LaBranche___Co_Inc_2008.pdf"
+    if not path.exists():
+        pytest.skip(f"Fixture not found: {path}")
+    return path.read_bytes()

@@ -14,12 +14,22 @@ import re
 
 import anthropic
 
-from config import CLAUDE_MODEL
+from config import CLAUDE_MODEL, VISION_EXTRACT_MAX_TOKENS
 
 
-# Prompt ported verbatim from extract-vision.ts lines 55-75
 _VISION_PROMPT_TEMPLATE = """This is page {page_number} of a financial statement ({statement_type_display}, template: {template_type}).
 Extract all financial line items as structured rows.
+
+IMPORTANT layout guidance:
+- This page may use a DUAL-COLUMN layout (e.g., assets on the left and liabilities
+  on the right, or operating activities on the left and investing/financing on the right).
+  Extract ALL items from EVERY column — do not stop after the first column.
+- If the page has a WIDE TABLE with many columns, read each column header carefully
+  and map values to the correct year/period.
+- Read the ENTIRE page from top to bottom, left to right.
+- Include items from supplemental disclosures or footnote sections if they contain
+  financial data with numeric values.
+
 Return JSON matching this schema exactly:
 {{
   "rows": [
@@ -70,7 +80,7 @@ def extract_statement_from_image(
     client = anthropic.Anthropic()
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=VISION_EXTRACT_MAX_TOKENS,
         messages=[
             {
                 "role": "user",

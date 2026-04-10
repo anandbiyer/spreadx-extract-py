@@ -29,6 +29,9 @@ class ClassifiedPage(BaseModel):
     ascii_ratio: float
     text_content: str = ""
     requires_ocr: bool = False
+    drawing_count: int = 0
+    page_width: float = 0.0
+    page_height: float = 0.0
     section_type: str | None = None
     secondary_section_type: str | None = None
     image_buffer: bytes | None = Field(default=None, exclude=True)

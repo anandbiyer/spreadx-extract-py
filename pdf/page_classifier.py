@@ -60,6 +60,9 @@ def classify_pdf_pages(pdf_bytes: bytes) -> list[ClassifiedPage]:
 
             classification = classify_by_thresholds(word_count, ascii_ratio)
 
+            # Count vector drawings (used for hybrid detection and DPI decisions)
+            drawing_count = len(page.get_drawings())
+
             pages.append(
                 ClassifiedPage(
                     page_number=page_idx + 1,  # 1-based
@@ -68,6 +71,9 @@ def classify_pdf_pages(pdf_bytes: bytes) -> list[ClassifiedPage]:
                     ascii_ratio=round(ascii_ratio, 4),
                     text_content=text if classification != "scanned" else "",
                     requires_ocr=classification == "scanned",
+                    drawing_count=drawing_count,
+                    page_width=page.rect.width,
+                    page_height=page.rect.height,
                 )
             )
     finally:

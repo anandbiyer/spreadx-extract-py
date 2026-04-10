@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable
 
-from claude.extract import extract_statement
+from claude.extract import extract_statement, segment_page_text
 from claude.extract_notes import extract_note
 from claude.extract_vision import extract_statement_from_image
 from models.extraction import NoteExtraction, parse_note_number
@@ -19,7 +19,7 @@ from models.page import ClassifiedPage, FilterResult
 from pdf.column_classifier import classify_column_headers
 from pdf.page_classifier import classify_pdf_pages, summarize_classifications
 from pdf.page_filter import filter_financial_pages
-from pdf.page_rasterizer import rasterize_page, rasterize_pages
+from pdf.page_rasterizer import detect_and_correct_rotation, rasterize_page, rasterize_pages, rotate_image_90
 from pdf.scope_detector import detect_scope
 from pdf.statement_classifier import (
     classify_scanned_pages,
@@ -97,6 +97,21 @@ def run_pipeline(
         page.secondary_section_type = hits[1].statement_type if len(hits) > 1 else None
     _notify(progress_callback, "S2b", "Statement types assigned", 0.25)
 
+    # ── S2c: Hybrid page detection ──────────────────────────────────────
+    # Detect pages classified as "digital" but with suspiciously incomplete
+    # text (high drawing count vs low word count). These are hybrid pages
+    # where labels are vector-drawn and invisible to text extraction.
+    # Reroute them through the scanned/vision path for accurate extraction.
+    for page in pages:
+        if page.classification != "digital":
+            continue
+        if (page.drawing_count > 100
+                and page.drawing_count > 0
+                and page.word_count < page.drawing_count * 0.5):
+            page.classification = "scanned"
+            page.requires_ocr = True
+            # Keep text_content intact for potential fallback
+
     # ── S3: Financial page filtering ─────────────────────────────────────
     _notify(progress_callback, "S3", "Filtering financial pages...", 0.28)
     filter_result = filter_financial_pages(pages)
@@ -139,6 +154,12 @@ def run_pipeline(
                     arr2.append(page_num)
                     filter_result.selected_pages[secondary] = arr2
 
+        # Clear S4b classification buffers so S5 re-rasterizes at full DPI.
+        # The 1.5x classification images are too low-res for data extraction
+        # on dense or multi-column pages.
+        for page in scanned_pages:
+            page.image_buffer = None
+
     # ── S5: Row extraction ───────────────────────────────────────────────
     _notify(progress_callback, "S5", "Extracting rows...", 0.38)
     all_rows: list[dict] = []
@@ -149,6 +170,8 @@ def run_pipeline(
     )
     pages_extracted = 0
 
+    from config import MAX_CONCAT_TEXT_FOR_EXTRACT
+
     for stmt_type in STATEMENT_TYPES:
         page_nums = filter_result.selected_pages.get(stmt_type, [])
         if not page_nums:
@@ -158,7 +181,89 @@ def run_pipeline(
         first_page = page_map.get(page_nums[0])
         scope = detect_scope(first_page.text_content) if first_page else "unknown"
 
-        for page_num in page_nums:
+        # Split pages into digital and scanned groups
+        digital_pages = [
+            page_map[pn] for pn in page_nums
+            if page_map.get(pn) and page_map[pn].classification == "digital"
+        ]
+        scanned_page_nums = [
+            pn for pn in page_nums
+            if page_map.get(pn) and page_map[pn].classification != "digital"
+        ]
+
+        # ── Digital path: segment, concatenate, extract once ────────────
+        if digital_pages:
+            pages_extracted += len(digital_pages)
+            pct = 0.38 + (pages_extracted / max(total_pages_to_extract, 1)) * 0.42
+            dp_nums = [p.page_number for p in digital_pages]
+            _notify(
+                progress_callback,
+                "S5",
+                f"Extracting {stmt_type} digital pages {dp_nums} ({pages_extracted}/{total_pages_to_extract})...",
+                pct,
+            )
+
+            # Segment each page to isolate target statement, then concatenate
+            segments = [
+                segment_page_text(p.text_content, stmt_type)
+                for p in digital_pages
+            ]
+            combined_text = "\n\n--- PAGE BREAK ---\n\n".join(segments)
+            combined_text = combined_text[:MAX_CONCAT_TEXT_FOR_EXTRACT]
+
+            rows = extract_statement(
+                combined_text, stmt_type, template_type,
+                max_text_length=MAX_CONCAT_TEXT_FOR_EXTRACT,
+            )
+
+            # Fallback 1: if concatenated extraction returned 0 rows,
+            # retry with per-page extraction (some PDFs work better
+            # when pages are extracted individually)
+            if not rows and len(digital_pages) > 1:
+                for dp in digital_pages:
+                    seg = segment_page_text(dp.text_content, stmt_type)
+                    page_rows = extract_statement(seg, stmt_type, template_type)
+                    rows.extend(page_rows)
+
+            # Fallback 2: if text extraction still returned 0 rows,
+            # retry each page through the vision path (rasterize + OCR)
+            if not rows:
+                for dp in digital_pages:
+                    try:
+                        png = rasterize_page(pdf_bytes, dp.page_number, dpi_scale)
+                        png = detect_and_correct_rotation(
+                            png, dp.page_width, dp.page_height,
+                        )
+                        vision_rows = extract_statement_from_image(
+                            png, stmt_type, template_type, dp.page_number,
+                        )
+                        rows.extend(vision_rows)
+                        ocr_page_nums.add(dp.page_number)
+                    except Exception:
+                        pass
+
+            # Enrich rows with metadata (use first digital page for page number)
+            first_dp = digital_pages[0].page_number
+            year_keys: list[str] = []
+            for r in rows:
+                year_keys.extend(r.get("raw_values", {}).keys())
+            unique_years = list(set(year_keys))
+            col_meta_list = classify_column_headers(unique_years)
+            col_meta = {
+                str(m.year or m.label): {"type": m.type, "label": m.label}
+                for m in col_meta_list
+            }
+            for r in rows:
+                if not r.get("raw_label", "").strip():
+                    continue
+                r["statement_type"] = stmt_type
+                r["statement_scope"] = scope
+                r["page"] = first_dp
+                r["column_metadata"] = col_meta
+                all_rows.append(r)
+
+        # ── Scanned path: extract each page individually via vision ─────
+        for page_num in scanned_page_nums:
             page_data = page_map.get(page_num)
             if not page_data:
                 continue
@@ -172,39 +277,50 @@ def run_pipeline(
                 pct,
             )
 
-            rows: list[dict] = []
+            rows = []
+            try:
+                # Adaptive DPI: use higher resolution for dense vector-drawn pages
+                effective_dpi = dpi_scale
+                if page_data.drawing_count > 2000:
+                    effective_dpi = max(dpi_scale, 3.0)
 
-            if page_data.classification == "digital":
-                rows = extract_statement(page_data.text_content, stmt_type, template_type)
-            else:
-                try:
-                    # Reuse PNG from S4b if available
-                    png = page_data.image_buffer or rasterize_page(pdf_bytes, page_num, dpi_scale)
-                    rows = extract_statement_from_image(png, stmt_type, template_type, page_num)
-                    ocr_page_nums.add(page_num)
-                except Exception:
-                    # Fallback: try text extraction if vision fails
-                    if page_data.text_content:
-                        rows = extract_statement(page_data.text_content, stmt_type, template_type)
+                png = page_data.image_buffer or rasterize_page(pdf_bytes, page_num, effective_dpi)
+                png = detect_and_correct_rotation(
+                    png, page_data.page_width, page_data.page_height,
+                )
+                rows = extract_statement_from_image(png, stmt_type, template_type, page_num)
+
+                # Retry on 0 rows: try rotated image (catches sideways tables
+                # where content fills the page and bbox detection doesn't trigger)
+                if not rows:
+                    retry_dpi = max(effective_dpi, 3.0)
+                    retry_png = rasterize_page(pdf_bytes, page_num, retry_dpi)
+                    retry_png = rotate_image_90(retry_png)
+                    rows = extract_statement_from_image(retry_png, stmt_type, template_type, page_num)
+
+                ocr_page_nums.add(page_num)
+            except Exception:
+                # Fallback: try text extraction if vision fails
+                if page_data.text_content:
+                    rows = extract_statement(page_data.text_content, stmt_type, template_type)
 
             # Enrich rows with metadata
-            year_keys: list[str] = []
+            year_keys_s: list[str] = []
             for r in rows:
-                year_keys.extend(r.get("raw_values", {}).keys())
-            unique_years = list(set(year_keys))
-            col_meta_list = classify_column_headers(unique_years)
-            col_meta = {
+                year_keys_s.extend(r.get("raw_values", {}).keys())
+            unique_years_s = list(set(year_keys_s))
+            col_meta_list_s = classify_column_headers(unique_years_s)
+            col_meta_s = {
                 str(m.year or m.label): {"type": m.type, "label": m.label}
-                for m in col_meta_list
+                for m in col_meta_list_s
             }
-
             for r in rows:
                 if not r.get("raw_label", "").strip():
                     continue
                 r["statement_type"] = stmt_type
                 r["statement_scope"] = scope
                 r["page"] = page_num
-                r["column_metadata"] = col_meta
+                r["column_metadata"] = col_meta_s
                 all_rows.append(r)
 
     result.extracted_rows = all_rows

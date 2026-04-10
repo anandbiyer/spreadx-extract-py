@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 from pipeline.orchestrator import run_pipeline, PipelineResult
 
 
-def _mock_extract_statement(page_text, stmt_type, template):
+def _mock_extract_statement(page_text, stmt_type, template, **kwargs):
     """Return 2 fake rows for any statement extraction."""
     return [
         {
@@ -62,8 +62,11 @@ def test_pipeline_calls_stages_in_order(mock_extract, mock_note, pdf_lt_finance)
 
 @patch("pipeline.orchestrator.extract_note", side_effect=_mock_extract_note)
 @patch("pipeline.orchestrator.extract_statement", return_value=[])
-def test_pipeline_skips_empty_statements(mock_extract, mock_note, pdf_lt_finance):
-    """When extract returns empty rows, result has 0 rows for that type."""
+@patch("pipeline.orchestrator.extract_statement_from_image", return_value=[])
+@patch("pipeline.orchestrator.rasterize_page", return_value=b"\x89PNG fake")
+@patch("pipeline.orchestrator.detect_and_correct_rotation", side_effect=lambda png, w, h: png)
+def test_pipeline_skips_empty_statements(mock_rotation, mock_rasterize, mock_vision, mock_extract, mock_note, pdf_lt_finance):
+    """When both text and vision extraction return empty, result has 0 rows."""
     result = run_pipeline(pdf_lt_finance, "T3")
     assert result.extracted_rows == []
 
